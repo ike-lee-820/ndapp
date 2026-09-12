@@ -8,6 +8,8 @@ import android.os.IBinder
 import android.util.Base64
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -18,6 +20,7 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class UploadService : Service() {
 
@@ -32,6 +35,7 @@ class UploadService : Service() {
     private val NOTIF_ID = 1001
     private lateinit var notificationManager: NotificationManager
     private val CLIENT_CHUNK_SIZE = 20L * 1024 * 1024
+    private val FILE_CONCURRENCY = 32
 
     companion object {
         const val CHANNEL_ID = "netdisk_upload"
@@ -81,22 +85,46 @@ class UploadService : Service() {
 
     private suspend fun uploadAll(workerUrl: String, password: String, baseFolder: String, items: List<UploadItem>) {
         val total = items.size
-        var success = 0
-        var fail = 0
-        for ((idx, item) in items.withIndex()) {
-            try {
-                uploadOne(workerUrl, password, baseFolder, item, idx, total)
-                success++
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                e.printStackTrace()
-                fail++
-            }
-            System.gc()
-            delay(300)
+        val success = AtomicInteger(0)
+        val fail = AtomicInteger(0)
+        val completed = AtomicInteger(0)
+
+        val semaphore = Semaphore(FILE_CONCURRENCY)
+
+        updateNotification("开始上传", "共 $total 个文件，$FILE_CONCURRENCY 并发", 0, true)
+
+        coroutineScope {
+            items.mapIndexed { idx, item ->
+                async(Dispatchers.IO) {
+                    semaphore.withPermit {
+                        try {
+                            uploadOne(workerUrl, password, baseFolder, item, idx, total)
+                            success.incrementAndGet()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            fail.incrementAndGet()
+                        } finally {
+                            val done = completed.incrementAndGet()
+                            val pct = (done * 100 / total)
+                            updateNotification(
+                                "上传中 ($done/$total)",
+                                "成功 ${success.get()} · 失败 ${fail.get()}",
+                                pct, done < total
+                            )
+                            if (done % 5 == 0) System.gc()
+                        }
+                    }
+                }
+            }.awaitAll()
         }
-        updateNotification("全部完成", "成功 $success / 失败 $fail（共 $total）", 100, false)
+
+        updateNotification(
+            "全部完成",
+            "成功 ${success.get()} / 失败 ${fail.get()}（共 $total）",
+            100, false
+        )
     }
 
     private suspend fun uploadOne(
@@ -109,9 +137,7 @@ class UploadService : Service() {
             if (rel.isNotEmpty()) append(rel).append('/')
             append(item.name)
         }
-        val taskId = "android_" + System.currentTimeMillis() + "_" + (10000..99999).random()
-
-        updateNotification("上传 (${idx + 1}/$total)", "${item.name} - 初始化...", idx * 100 / total, true)
+        val taskId = "android_" + System.currentTimeMillis() + "_" + (10000..99999).random() + "_" + idx
 
         val startBody = JSONObject().apply {
             put("path", filePath)
@@ -158,14 +184,6 @@ class UploadService : Service() {
 
                 sentBytes += chunk.size
                 index++
-
-                val filePct = (sentBytes.toFloat() / item.size.coerceAtLeast(1) * 100).toInt().coerceIn(0, 100)
-                val overallPct = ((idx + sentBytes.toFloat() / item.size.coerceAtLeast(1)) / total * 100).toInt()
-                updateNotification(
-                    "上传 (${idx + 1}/$total)",
-                    "${item.name} - $filePct% ($index/$chunks 分片)",
-                    overallPct, true
-                )
                 yield()
             }
         }
